@@ -2,7 +2,7 @@ name: Deploy Vite site to GitHub Pages
 
 on:
   push:
-    branches: [ "main" ]   # 你代码在哪个分支就写哪个
+    branches: [ "main", "master" ]
 
 permissions:
   contents: read
