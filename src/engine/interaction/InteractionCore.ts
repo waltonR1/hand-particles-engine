@@ -1,43 +1,172 @@
 import type { InteractionEvent } from "./InteractionTypes";
-import { clamp01, lerp } from "../../utils/math";
+import { clamp01 } from "../../utils/math";
 import type { ShapeName } from "../particles/ShapeTypes";
 
 /**
- * InteractionCore：把事件聚合成“统一状态”
- * 视觉系统只看 state，不关心手势/输入源
+ * ======================================================
+ * InteractionState
+ * ======================================================
+ *
+ * InteractionState 是「视觉系统唯一关心的输入状态」。
+ *
+ * 核心思想（IMPORTANT）：
+ * - 手势系统、输入系统 → 产生 InteractionEvent
+ * - InteractionCore → 把“离散事件流”汇总成“连续状态”
+ * - 粒子 / 渲染系统 → 只读取 InteractionState
+ *
+ * 换句话说：
+ * 👉 视觉系统不需要知道“发生了什么手势”
+ * 👉 只需要知道“现在应该长什么样”
+ *
+ * 这是一种：
+ * - Event-driven → State-driven 的架构过渡层
+ * ======================================================
  */
 export type InteractionState = {
+
+    /**
+     * 当前交互模式
+     *
+     * 语义：
+     * - NONE   ：无手 / 无输入
+     * - SINGLE ：单手交互
+     * - DUAL   ：双手交互
+     *
+     * 用途：
+     * - 控制粒子系统的行为分支
+     * - 切换不同交互逻辑
+     */
     mode: "NONE" | "SINGLE" | "DUAL";
 
-    // 平移（世界坐标）
+    /**
+     * 平移（世界坐标）
+     *
+     * 说明：
+     * - 这是已经映射到“世界空间”的值
+     * - 不再是屏幕归一化坐标
+     *
+     * 使用方式：
+     * - 粒子系统可直接使用 panX / panY
+     */
     panX: number;
     panY: number;
 
-    // 缩放（世界 scale）
+    /**
+     * 缩放因子（世界 scale）
+     *
+     * 语义：
+     * - 表示目标缩放值
+     * - 是否平滑、如何平滑，由粒子系统决定
+     */
     zoom: number;
 
-    // 旋转（仅双手用）
+    /**
+     * 旋转角度
+     *
+     * 语义：
+     * - 围绕 Z 轴的旋转
+     * - 通常只在 DUAL 模式下有意义
+     *
+     * 单位：
+     * - 弧度（radians）
+     */
     rotation: number;
 
-    // 聚散（0..1）
+    /**
+     * 聚散程度
+     *
+     * 数值约定：
+     * - spread ∈ [0, 1]
+     *
+     * 语义：
+     * - 0   → 非常集中
+     * - 1   → 非常分散
+     */
     spread: number;
 
-    // 脉冲事件
+    /**
+     * 脉冲型事件：scatter / converge
+     *
+     * 设计说明（IMPORTANT）：
+     * - 这两个字段只在“当前帧”有效
+     * - update() 每次都会先重置为 false
+     *
+     * 使用方式：
+     * - 粒子系统检测到 true → 触发一次性效果
+     */
     scatter: boolean;
     converge: boolean;
 
-    // 静止程度，用于呼吸（0..1）
+    /**
+     * 静止程度
+     *
+     * 数值约定：
+     * - stillness ∈ [0, 1]
+     * - 1 表示非常稳定 / 静止
+     *
+     * 使用场景：
+     * - 呼吸动画
+     * - idle 状态过渡
+     */
     stillness: number;
 
-    // 目标形状
+    /**
+     * 当前目标形状
+     *
+     * 语义：
+     * - 表示“希望呈现的形状”
+     * - 是否立即切换 or 平滑过渡，由粒子系统决定
+     */
     shape: ShapeName;
 
-    // UI 展示用
+    /**
+     * UI 展示用：当前识别到的手势标签
+     *
+     * 注意：
+     * - 不参与任何物理 / 粒子计算
+     * - 纯调试 / UI 反馈用途
+     */
     gestureLabel: string;
+
+    /**
+     * UI 展示用：抖动能量
+     *
+     * 语义：
+     * - 描述当前输入的“躁动程度”
+     * - 不直接驱动行为
+     */
     shakeEnergy: number;
 };
 
+
+/**
+ * ======================================================
+ * InteractionCore
+ * ======================================================
+ *
+ * InteractionCore 的职责：
+ * - 接收一帧内产生的 InteractionEvent[]
+ * - 按规则“归并 / 覆盖 / 触发”
+ * - 生成一个稳定、完整的 InteractionState
+ *
+ * 核心特性：
+ * - 无历史（不存上一帧状态）
+ * - 行为完全由 events 决定
+ * - 不做平滑、不做动画
+ *
+ * 这使它成为：
+ * 👉 一个“纯语义 reducer”
+ * ======================================================
+ */
 export class InteractionCore {
+
+    /**
+     * 当前交互状态
+     *
+     * 初始值说明：
+     * - 表示系统启动时的“默认视觉状态”
+     * - 可被第一帧事件立即覆盖
+     */
     state: InteractionState = {
         mode: "NONE",
         panX: 0,
@@ -54,29 +183,53 @@ export class InteractionCore {
     };
 
     /**
-     * 更新状态：把一帧 events 汇总成 state
-     * 注意：scatter / converge 是“脉冲”，每帧会重置
+     * update：将一帧内的事件列表汇总为统一状态
+     *
+     * 行为说明（IMPORTANT）：
+     * - events 是“这一帧所有语义事件”的集合
+     * - 顺序可能影响最终结果（后来的事件覆盖前面的）
+     *
+     * 脉冲事件说明：
+     * - scatter / converge 在每次 update 开始时被清零
+     * - 只有当本帧 events 中包含对应事件时才为 true
      */
     update(events: InteractionEvent[]) {
-        // 脉冲先清零
+
+        // ==========================
+        // 1️⃣ 重置脉冲型状态
+        // ==========================
         this.state.scatter = false;
         this.state.converge = false;
 
+        // ==========================
+        // 2️⃣ 逐事件归并
+        // ==========================
         for (const e of events) {
             switch (e.type) {
+
                 case "MODE":
                     this.state.mode = e.mode;
                     break;
 
                 case "MOVE": {
-                    // MOVE 用归一化坐标映射到世界
+                    /**
+                     * MOVE 事件使用的是“归一化屏幕坐标”
+                     *
+                     * 这里做的事情：
+                     * - 把 [0, 1] 映射到世界空间
+                     * - 同时对 Y 轴取反（屏幕 → 世界）
+                     *
+                     * 经验参数说明：
+                     * - 3.0 / 1.9 是视觉比例相关的缩放因子
+                     */
                     this.state.panX = (e.nx - 0.5) * 3.0;
                     this.state.panY = -(e.ny - 0.5) * 1.9;
                     break;
                 }
 
                 case "ZOOM":
-                    // 直接设目标缩放（平滑在粒子系统里做也行）
+                    // 直接设置目标缩放值
+                    // 是否平滑由粒子系统决定
                     this.state.zoom = e.value;
                     break;
 
@@ -85,6 +238,7 @@ export class InteractionCore {
                     break;
 
                 case "SPREAD":
+                    // 强制约束在 [0, 1]
                     this.state.spread = clamp01(e.value);
                     break;
 
@@ -93,6 +247,7 @@ export class InteractionCore {
                     break;
 
                 case "SCATTER":
+                    // 脉冲：只在当前帧有效
                     this.state.scatter = true;
                     break;
 
